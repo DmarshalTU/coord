@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# Local data dirs the daemon may create when run during development.
+/.coord
+/.coord-vault
+/.agentd
+/.agentd-vault
+
+# Editor cruft
+.DS_Store
+*.swp
