@@ -238,10 +238,7 @@ fn run_client(url: String, cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Wait(args) => wait::run(&client, &args),
-        Cmd::Serve(_)
-        | Cmd::Mcp(_)
-        | Cmd::Version
-        | Cmd::Init(_) => {
+        Cmd::Serve(_) | Cmd::Mcp(_) | Cmd::Version | Cmd::Init(_) => {
             unreachable!("handled in dispatch")
         }
     }

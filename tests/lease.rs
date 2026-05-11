@@ -51,7 +51,12 @@ fn extend_succeeds_only_for_current_claimer() {
         .unwrap()
         .unwrap();
 
-    let original_lease = store.get_task(task.id).unwrap().unwrap().lease_until.unwrap();
+    let original_lease = store
+        .get_task(task.id)
+        .unwrap()
+        .unwrap()
+        .lease_until
+        .unwrap();
 
     // Sleep just long enough that "now + extend" is strictly later
     // than the original lease. Without this the wall-clock could be

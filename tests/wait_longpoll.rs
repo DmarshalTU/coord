@@ -92,7 +92,14 @@ fn list_long_poll_unblocks_quickly_after_matching_send() {
 
     let send = Command::new(&coord)
         .args([
-            "--url", &url, "send", "urgent-bug", "--kind", "bug", "--priority", "high",
+            "--url",
+            &url,
+            "send",
+            "urgent-bug",
+            "--kind",
+            "bug",
+            "--priority",
+            "high",
         ])
         .output()
         .expect("send ran");

@@ -223,11 +223,13 @@ impl Bridge {
         .await
     }
 
-    #[tool(description = "Atomically claim a pending task as `agent_id` and acquire a \
+    #[tool(
+        description = "Atomically claim a pending task as `agent_id` and acquire a \
             lease. The task auto-reclaims back to `pending` if you don't `tasks_complete` \
             or `tasks_extend` before the lease expires (default 5 minutes). Errors with \
             'task is not claimable' if another agent already claimed it — that is the \
-            expected race signal.")]
+            expected race signal."
+    )]
     async fn tasks_claim(
         &self,
         Parameters(a): Parameters<ClaimArgs>,
@@ -243,11 +245,13 @@ impl Bridge {
         .await
     }
 
-    #[tool(description = "Push the lease forward on a task you currently hold the claim \
+    #[tool(
+        description = "Push the lease forward on a task you currently hold the claim \
             on. Call this on a timer (e.g. every minute) for long-running work, or just \
             before each meaningful step. Only the current claimer can extend; errors \
             'lease cannot be extended' if the task was reclaimed, cancelled, or \
-            completed.")]
+            completed."
+    )]
     async fn tasks_extend(
         &self,
         Parameters(a): Parameters<ExtendArgs>,
@@ -263,10 +267,12 @@ impl Bridge {
         .await
     }
 
-    #[tool(description = "Sweep expired claims back to `pending` so another agent can \
+    #[tool(
+        description = "Sweep expired claims back to `pending` so another agent can \
             pick them up. Usually called by the daemon's background ticker; expose it \
             here in case an operator wants to force the sweep. Returns the list of \
-            reclaimed tasks.")]
+            reclaimed tasks."
+    )]
     async fn tasks_reclaim(&self) -> Result<CallToolResult, McpError> {
         self.call("tasks/reclaim", json!({})).await
     }

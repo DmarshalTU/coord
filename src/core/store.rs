@@ -322,7 +322,10 @@ impl Store {
                         params![id],
                         row_to_task,
                     )?;
-                    out.push((snapshot.iter().find(|s| &s.id.to_string() == id).cloned(), t));
+                    out.push((
+                        snapshot.iter().find(|s| &s.id.to_string() == id).cloned(),
+                        t,
+                    ));
                 }
                 out
             }

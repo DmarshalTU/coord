@@ -67,7 +67,9 @@ pub async fn mcp(url: String) -> Result<()> {
 pub fn print_version() {
     println!("coord {}", env!("CARGO_PKG_VERSION"));
     println!("a2a   subset (tasks/send, tasks/get, tasks/cancel)");
-    println!("ext   tasks/claim, tasks/extend, tasks/reclaim, tasks/complete, tasks/list (long-poll)");
+    println!(
+        "ext   tasks/claim, tasks/extend, tasks/reclaim, tasks/complete, tasks/list (long-poll)"
+    );
     println!("mcp   bridge   (use `coord mcp` for stdio)");
     println!("vault markdown (use `coord serve --vault PATH` to enable)");
     println!("kinds task | bug | feature | decision | ack | knowledge | build");
