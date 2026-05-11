@@ -4,12 +4,18 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use coord::a2a;
 use coord::core::store::Store;
 use coord::mcp::Bridge;
+
+/// How often the background ticker calls `reclaim_expired_leases`.
+/// Short enough that a dead agent doesn't hold a task for long;
+/// long enough that the sweep is cheap on a busy bulletin.
+const RECLAIM_TICK: Duration = Duration::from_secs(30);
 
 pub async fn serve(addr: SocketAddr, db: Option<PathBuf>, vault: Option<PathBuf>) -> Result<()> {
     let db_path = db.unwrap_or_else(default_db_path);
@@ -19,7 +25,34 @@ pub async fn serve(addr: SocketAddr, db: Option<PathBuf>, vault: Option<PathBuf>
 
     tracing::info!(?db_path, ?vault, "opening state");
     let store = Arc::new(Store::open_with_vault(&db_path, vault)?);
-    let app = a2a::router(store);
+    let bus = a2a::ChangeBus::new();
+    let app = a2a::router_with_bus(store.clone(), bus.clone());
+
+    // Background reclaim sweep. Lazy reclaim on `tasks/list` keeps the
+    // bulletin self-healing for active readers, but the ticker covers
+    // the case where nobody is reading: a stuck task should still
+    // un-stick within `RECLAIM_TICK`. Each sweep notifies the bus so
+    // any long-pollers wake up immediately when a reclaim happens.
+    let ticker_store = store.clone();
+    let ticker_bus = bus.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RECLAIM_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match ticker_store.reclaim_expired_leases() {
+                Ok(reclaimed) if !reclaimed.is_empty() => {
+                    tracing::info!(
+                        count = reclaimed.len(),
+                        "reclaim_ticker: returned expired claims to pending"
+                    );
+                    ticker_bus.notify();
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "reclaim_ticker failed"),
+            }
+        }
+    });
 
     tracing::info!(%addr, "coord listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -33,11 +66,13 @@ pub async fn mcp(url: String) -> Result<()> {
 
 pub fn print_version() {
     println!("coord {}", env!("CARGO_PKG_VERSION"));
-    println!("a2a   subset 0.1");
+    println!("a2a   subset (tasks/send, tasks/get, tasks/cancel)");
+    println!("ext   tasks/claim, tasks/extend, tasks/reclaim, tasks/complete, tasks/list (long-poll)");
     println!("mcp   bridge   (use `coord mcp` for stdio)");
     println!("vault markdown (use `coord serve --vault PATH` to enable)");
     println!("kinds task | bug | feature | decision | ack | knowledge | build");
     println!("prio  low | normal | high | urgent");
+    println!("lease 300s default · 3600s max · auto-reclaim every 30s");
 }
 
 fn default_db_path() -> PathBuf {

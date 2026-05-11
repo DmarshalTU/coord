@@ -107,6 +107,24 @@ pub struct ClaimArgs {
     pub id: String,
     /// The agent ID claiming the task. Must match an id from `agents/heartbeat`.
     pub agent_id: String,
+    /// Optional lease length in seconds. Defaults to 300 (5 minutes).
+    /// Capped at 3600. Extend before this elapses with `tasks_extend`
+    /// or the task will auto-reclaim back to `pending` for someone
+    /// else to pick up.
+    #[serde(default)]
+    pub lease_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExtendArgs {
+    /// UUID of the task to extend.
+    pub id: String,
+    /// Agent ID currently holding the claim. Only the current claimer
+    /// can extend.
+    pub agent_id: String,
+    /// Optional new lease length in seconds. Defaults to 300.
+    #[serde(default)]
+    pub lease_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -140,6 +158,13 @@ pub struct ListArgs {
     /// Optional filter by state (e.g. "pending", "claimed", "completed").
     #[serde(default)]
     pub state: Option<String>,
+    /// If set and the initial result is empty, the server holds the
+    /// connection open up to this many milliseconds and returns the
+    /// instant a matching task lands. Capped at 60_000 server-side.
+    /// Use this to turn `tasks_list` into a watch primitive — much
+    /// cheaper than re-polling every 2 seconds.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
 #[tool_router]
@@ -174,9 +199,11 @@ impl Bridge {
     }
 
     #[tool(
-        description = "List recent tasks, optionally filtered by kind, priority, and/or state. \
-            Use this before claiming to find pending work, or with kind=\"bug\" priority=\"high\" \
-            to scan for urgent issues other agents have reported."
+        description = "List tasks with optional filters and optional long-poll. Filters \
+            (kind, priority, state) are applied in SQL so you get matching rows up to \
+            limit, not the most-recent N rows re-filtered in memory. Set wait_ms > 0 to \
+            block until a matching task lands — this is how you watch for something \
+            without polling. Returns an empty array on timeout."
     )]
     async fn tasks_list(
         &self,
@@ -190,20 +217,58 @@ impl Bridge {
                 "kind": a.kind,
                 "priority": a.priority,
                 "state": a.state,
+                "wait_ms": a.wait_ms,
             }),
         )
         .await
     }
 
-    #[tool(description = "Atomically claim a pending task as `agent_id`. \
-            Returns the task on success. Errors with 'task is not claimable' \
-            if another agent already claimed it — that is the expected race signal.")]
+    #[tool(description = "Atomically claim a pending task as `agent_id` and acquire a \
+            lease. The task auto-reclaims back to `pending` if you don't `tasks_complete` \
+            or `tasks_extend` before the lease expires (default 5 minutes). Errors with \
+            'task is not claimable' if another agent already claimed it — that is the \
+            expected race signal.")]
     async fn tasks_claim(
         &self,
         Parameters(a): Parameters<ClaimArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.call("tasks/claim", json!({ "id": a.id, "agentId": a.agent_id }))
-            .await
+        self.call(
+            "tasks/claim",
+            json!({
+                "id": a.id,
+                "agentId": a.agent_id,
+                "leaseSeconds": a.lease_seconds,
+            }),
+        )
+        .await
+    }
+
+    #[tool(description = "Push the lease forward on a task you currently hold the claim \
+            on. Call this on a timer (e.g. every minute) for long-running work, or just \
+            before each meaningful step. Only the current claimer can extend; errors \
+            'lease cannot be extended' if the task was reclaimed, cancelled, or \
+            completed.")]
+    async fn tasks_extend(
+        &self,
+        Parameters(a): Parameters<ExtendArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.call(
+            "tasks/extend",
+            json!({
+                "id": a.id,
+                "agentId": a.agent_id,
+                "leaseSeconds": a.lease_seconds,
+            }),
+        )
+        .await
+    }
+
+    #[tool(description = "Sweep expired claims back to `pending` so another agent can \
+            pick them up. Usually called by the daemon's background ticker; expose it \
+            here in case an operator wants to force the sweep. Returns the list of \
+            reclaimed tasks.")]
+    async fn tasks_reclaim(&self) -> Result<CallToolResult, McpError> {
+        self.call("tasks/reclaim", json!({})).await
     }
 
     #[tool(description = "Mark a claimed task as completed and record an optional JSON result.")]

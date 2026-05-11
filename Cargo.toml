@@ -1,9 +1,9 @@
 [package]
 name = "coord"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["Denis Tu <dmarshaltu@gmail.com>"]
-description = "A local coordinator for parallel AI coding agents. Atomic task claims, blocking watch primitive, MCP + A2A. One binary."
+description = "Local coordinator for parallel AI coding agents. Long-poll watch, leased atomic claims, MCP + A2A-subset JSON-RPC. One binary."
 license = "MIT"
 repository = "https://github.com/DmarshalTU/coord"
 homepage = "https://github.com/DmarshalTU/coord"

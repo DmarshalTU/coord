@@ -6,15 +6,30 @@
 //! a graph view of the project's nervous system for free.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::types::{Agent, Task, TaskState, DEFAULT_KIND, DEFAULT_PRIORITY};
+use super::types::{
+    Agent, Task, TaskState, DEFAULT_KIND, DEFAULT_LEASE_SECONDS, DEFAULT_PRIORITY,
+    MAX_LEASE_SECONDS,
+};
 use crate::vault::Vault;
+
+/// SQL-side filter applied to `list_tasks_filtered`. Each `Some` field
+/// becomes a `WHERE` clause so the database returns only matching rows
+/// rather than the most-recent N rows that we then re-filter in
+/// memory. The latter silently drops matches when the bulletin is
+/// busy — see the 0.4 SQL-pushdown work for the regression test.
+#[derive(Default, Debug, Clone)]
+pub struct TaskFilter {
+    pub state: Option<String>,
+    pub kind: Option<String>,
+    pub priority: Option<String>,
+}
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -38,6 +53,11 @@ impl Store {
         // those specifically and let real errors surface.
         try_add_column(&conn, "tasks", "kind", "TEXT NOT NULL DEFAULT 'task'")?;
         try_add_column(&conn, "tasks", "priority", "TEXT NOT NULL DEFAULT 'normal'")?;
+        // Lease columns are nullable: unclaimed tasks have no lease, and
+        // legacy rows from before the migration keep NULLs (the
+        // reclaim sweep treats NULL as "no lease, don't touch").
+        try_add_column(&conn, "tasks", "claimed_at", "TEXT")?;
+        try_add_column(&conn, "tasks", "lease_until", "TEXT")?;
         // `first_seen` defaults to epoch on existing rows; the next heartbeat
         // for that agent will not overwrite it (see UPSERT in `heartbeat`).
         try_add_column(
@@ -45,6 +65,13 @@ impl Store {
             "agents",
             "first_seen",
             "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'",
+        )?;
+        // Index just `lease_until` so the periodic reclaim sweep is a
+        // cheap range scan even when the bulletin has thousands of
+        // completed/cancelled rows that don't carry a lease.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_lease_until ON tasks(lease_until)",
+            [],
         )?;
 
         let vault = vault_dir
@@ -102,6 +129,8 @@ impl Store {
             result: None,
             created_at: now,
             updated_at: now,
+            claimed_at: None,
+            lease_until: None,
         };
         self.vault_write(&task);
         Ok(task)
@@ -111,7 +140,8 @@ impl Store {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
-                "SELECT id, name, kind, priority, state, claimed_by, payload, result, created_at, updated_at
+                "SELECT id, name, kind, priority, state, claimed_by, payload, result, \
+                 created_at, updated_at, claimed_at, lease_until \
                  FROM tasks WHERE id = ?1",
                 params![id.to_string()],
                 row_to_task,
@@ -121,33 +151,82 @@ impl Store {
     }
 
     pub fn list_tasks(&self, limit: usize) -> Result<Vec<Task>> {
+        self.list_tasks_filtered(limit, &TaskFilter::default())
+    }
+
+    /// Filtered list. Filters are applied in SQL so callers receive
+    /// matching rows up to `limit`, not just the N most-recent rows
+    /// re-filtered in memory (which silently drops matches when the
+    /// bulletin is busy).
+    pub fn list_tasks_filtered(&self, limit: usize, filter: &TaskFilter) -> Result<Vec<Task>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, kind, priority, state, claimed_by, payload, result, created_at, updated_at
-             FROM tasks ORDER BY created_at DESC LIMIT ?1",
-        )?;
+        let mut sql = String::from(
+            "SELECT id, name, kind, priority, state, claimed_by, payload, result, \
+             created_at, updated_at, claimed_at, lease_until \
+             FROM tasks",
+        );
+        let mut clauses: Vec<&'static str> = Vec::new();
+        let mut bind: Vec<String> = Vec::new();
+        if let Some(s) = &filter.state {
+            clauses.push("state = ?");
+            bind.push(s.clone());
+        }
+        if let Some(k) = &filter.kind {
+            clauses.push("kind = ?");
+            bind.push(k.clone());
+        }
+        if let Some(p) = &filter.priority {
+            clauses.push("priority = ?");
+            bind.push(p.clone());
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bind_refs: Vec<&dyn rusqlite::ToSql> =
+            bind.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let limit_i = limit as i64;
+        bind_refs.push(&limit_i);
         let rows = stmt
-            .query_map(params![limit as i64], row_to_task)?
+            .query_map(rusqlite::params_from_iter(bind_refs), row_to_task)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// Atomically transition a `pending` task to `claimed` for `agent_id`.
-    /// Returns the task on success or `None` if it was already claimed.
-    pub fn claim_task(&self, id: Uuid, agent_id: &str) -> Result<Option<Task>> {
+    /// Atomically transition a `pending` task to `claimed` for `agent_id`,
+    /// granting a fresh lease of `lease_seconds` (clamped to
+    /// `MAX_LEASE_SECONDS`). Returns the claimed task on success, or
+    /// `None` if it was already claimed.
+    pub fn claim_task(
+        &self,
+        id: Uuid,
+        agent_id: &str,
+        lease_seconds: Option<u64>,
+    ) -> Result<Option<Task>> {
         let now = Utc::now();
+        let lease = clamp_lease(lease_seconds.unwrap_or(DEFAULT_LEASE_SECONDS));
+        let lease_until = now + Duration::seconds(lease as i64);
         let task_opt = {
             let conn = self.conn.lock();
             let updated = conn.execute(
-                "UPDATE tasks SET state = 'claimed', claimed_by = ?1, updated_at = ?2
-                 WHERE id = ?3 AND state = 'pending'",
-                params![agent_id, now.to_rfc3339(), id.to_string()],
+                "UPDATE tasks SET state = 'claimed', claimed_by = ?1, claimed_at = ?2,
+                                  lease_until = ?3, updated_at = ?2
+                 WHERE id = ?4 AND state = 'pending'",
+                params![
+                    agent_id,
+                    now.to_rfc3339(),
+                    lease_until.to_rfc3339(),
+                    id.to_string(),
+                ],
             )?;
             if updated == 0 {
                 None
             } else {
                 Some(conn.query_row(
-                    "SELECT id, name, kind, priority, state, claimed_by, payload, result, created_at, updated_at
+                    "SELECT id, name, kind, priority, state, claimed_by, payload, result, \
+                     created_at, updated_at, claimed_at, lease_until \
                      FROM tasks WHERE id = ?1",
                     params![id.to_string()],
                     row_to_task,
@@ -161,16 +240,133 @@ impl Store {
         Ok(task_opt)
     }
 
+    /// Push the lease forward on a currently-claimed task. Idempotent
+    /// and race-safe: only the current claimer can extend, and only
+    /// while the task is still `claimed`. Returns the new
+    /// `lease_until` on success, or `None` if the agent no longer
+    /// owns the claim (cancelled, completed, reclaimed, or another
+    /// agent took over after a reclaim).
+    pub fn extend_lease(
+        &self,
+        id: Uuid,
+        agent_id: &str,
+        lease_seconds: Option<u64>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let now = Utc::now();
+        let lease = clamp_lease(lease_seconds.unwrap_or(DEFAULT_LEASE_SECONDS));
+        let lease_until = now + Duration::seconds(lease as i64);
+        let updated = {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET lease_until = ?1, updated_at = ?2
+                 WHERE id = ?3 AND state = 'claimed' AND claimed_by = ?4",
+                params![
+                    lease_until.to_rfc3339(),
+                    now.to_rfc3339(),
+                    id.to_string(),
+                    agent_id,
+                ],
+            )?
+        };
+        if updated == 0 {
+            return Ok(None);
+        }
+        if let Some(t) = self.get_task(id)? {
+            self.vault_write(&t);
+        }
+        Ok(Some(lease_until))
+    }
+
+    /// Sweep claimed tasks whose lease has expired back to `pending`,
+    /// clearing `claimed_by` and lease fields so another agent can pick
+    /// them up. Called periodically by the daemon and on every
+    /// `tasks/list` to keep the bulletin self-healing. Returns the
+    /// reclaimed tasks (in their post-reclaim `pending` shape) so
+    /// callers can log / write vault notes.
+    pub fn reclaim_expired_leases(&self) -> Result<Vec<Task>> {
+        let now = Utc::now();
+        let reclaimed = {
+            let conn = self.conn.lock();
+            // Snapshot the to-be-reclaimed rows first so we can write
+            // vault notes that record who abandoned what. The actual
+            // state transition is a single UPDATE for atomicity.
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, priority, state, claimed_by, payload, result, \
+                 created_at, updated_at, claimed_at, lease_until \
+                 FROM tasks \
+                 WHERE state = 'claimed' AND lease_until IS NOT NULL AND lease_until < ?1",
+            )?;
+            let snapshot: Vec<Task> = stmt
+                .query_map(params![now.to_rfc3339()], row_to_task)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if snapshot.is_empty() {
+                Vec::new()
+            } else {
+                conn.execute(
+                    "UPDATE tasks SET state = 'pending', claimed_by = NULL, \
+                                       claimed_at = NULL, lease_until = NULL, \
+                                       updated_at = ?1 \
+                     WHERE state = 'claimed' AND lease_until IS NOT NULL AND lease_until < ?1",
+                    params![now.to_rfc3339()],
+                )?;
+                // Re-fetch the post-reclaim shape (state='pending',
+                // claimed_by=NULL) so the returned vec matches what
+                // any subsequent `tasks/list` would show.
+                let ids: Vec<String> = snapshot.iter().map(|t| t.id.to_string()).collect();
+                let mut out = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    let t = conn.query_row(
+                        "SELECT id, name, kind, priority, state, claimed_by, payload, result, \
+                         created_at, updated_at, claimed_at, lease_until \
+                         FROM tasks WHERE id = ?1",
+                        params![id],
+                        row_to_task,
+                    )?;
+                    out.push((snapshot.iter().find(|s| &s.id.to_string() == id).cloned(), t));
+                }
+                out
+            }
+        };
+        let mut returned = Vec::with_capacity(reclaimed.len());
+        for (before, after) in reclaimed {
+            if let Some(before) = before {
+                if let Some(agent) = &before.claimed_by {
+                    self.vault_agent_event(
+                        agent,
+                        &format!(
+                            "abandoned [[{}]] (lease expired at {})",
+                            task_slug(&before),
+                            before
+                                .lease_until
+                                .map(|d| d.to_rfc3339())
+                                .unwrap_or_else(|| "unknown".into()),
+                        ),
+                    );
+                }
+                tracing::info!(
+                    task = %before.id,
+                    agent = ?before.claimed_by,
+                    "reclaimed expired lease"
+                );
+            }
+            self.vault_write(&after);
+            returned.push(after);
+        }
+        Ok(returned)
+    }
+
     /// Mark a claimed task complete. Idempotent against races: only
     /// transitions when current state is `claimed`, so a `cancel` that
-    /// sneaks in first is sticky. Returns true on success.
+    /// sneaks in first is sticky. Clears the lease so the row no
+    /// longer trips the reclaim sweep. Returns true on success.
     pub fn complete_task(&self, id: Uuid, result: serde_json::Value) -> Result<bool> {
         let now = Utc::now();
         let result_s = serde_json::to_string(&result)?;
         let updated = {
             let conn = self.conn.lock();
             conn.execute(
-                "UPDATE tasks SET state = 'completed', result = ?1, updated_at = ?2
+                "UPDATE tasks SET state = 'completed', result = ?1, lease_until = NULL,
+                                  updated_at = ?2
                  WHERE id = ?3 AND state = 'claimed'",
                 params![result_s, now.to_rfc3339(), id.to_string()],
             )?
@@ -191,7 +387,8 @@ impl Store {
         {
             let conn = self.conn.lock();
             conn.execute(
-                "UPDATE tasks SET state = 'cancelled', updated_at = ?1 WHERE id = ?2",
+                "UPDATE tasks SET state = 'cancelled', lease_until = NULL, updated_at = ?1
+                 WHERE id = ?2",
                 params![now.to_rfc3339(), id.to_string()],
             )?;
         }
@@ -336,6 +533,15 @@ fn default_state_for_kind(kind: &str) -> TaskState {
     }
 }
 
+/// Clamp a requested lease length to a sane range. Zero (and anything
+/// suspiciously small) bumps up to a few seconds — otherwise an agent
+/// could claim a task and have it auto-reclaimed before its next
+/// instruction. The high end is capped to keep the bulletin healable
+/// even when an agent forgets to extend.
+fn clamp_lease(secs: u64) -> u64 {
+    secs.clamp(1, MAX_LEASE_SECONDS)
+}
+
 /// Human/wikilink-friendly slug for a task — used as the markdown
 /// filename and the wikilink target in agent notes.
 pub(crate) fn task_slug(task: &Task) -> String {
@@ -381,6 +587,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let result = result.and_then(|s| serde_json::from_str(&s).ok());
     let created_at: String = row.get(8)?;
     let updated_at: String = row.get(9)?;
+    let claimed_at: Option<String> = row.get(10).ok();
+    let lease_until: Option<String> = row.get(11).ok();
     let parse_ts = |s: &str| -> rusqlite::Result<chrono::DateTime<Utc>> {
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
@@ -391,6 +599,12 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
                     Box::new(e),
                 )
             })
+    };
+    let parse_opt_ts = |s: Option<String>| -> rusqlite::Result<Option<DateTime<Utc>>> {
+        match s {
+            Some(s) if !s.is_empty() => parse_ts(&s).map(Some),
+            _ => Ok(None),
+        }
     };
     Ok(Task {
         id,
@@ -403,6 +617,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         result,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
+        claimed_at: parse_opt_ts(claimed_at)?,
+        lease_until: parse_opt_ts(lease_until)?,
     })
 }
 
@@ -430,11 +646,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     kind        TEXT NOT NULL DEFAULT 'task',
-    priority    TEXT NOT NULL DEFAULT 'normal'
+    priority    TEXT NOT NULL DEFAULT 'normal',
+    claimed_at  TEXT,
+    lease_until TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
 CREATE INDEX IF NOT EXISTS idx_tasks_kind_priority ON tasks(kind, priority);
+CREATE INDEX IF NOT EXISTS idx_tasks_lease_until ON tasks(lease_until);
 
 CREATE TABLE IF NOT EXISTS agents (
     id         TEXT PRIMARY KEY,

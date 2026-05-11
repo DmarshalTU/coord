@@ -59,12 +59,30 @@ pub enum Cmd {
         #[arg(long, default_value = "normal")]
         priority: String,
     },
-    /// Atomically claim a pending task as `agent_id`.
+    /// Atomically claim a pending task as `agent_id` with a lease.
+    /// Extend before the lease expires or the task auto-reclaims.
     Claim {
         id: Uuid,
         #[arg(long = "as")]
         agent_id: String,
+        /// Lease length in seconds. Defaults to 300 (5 minutes).
+        #[arg(long = "lease", default_value_t = 300)]
+        lease_seconds: u64,
     },
+    /// Push the lease forward on a task you currently hold. Run on a
+    /// timer (or before each long step) so the task doesn't get
+    /// reclaimed underneath you.
+    Extend {
+        id: Uuid,
+        #[arg(long = "as")]
+        agent_id: String,
+        #[arg(long = "lease", default_value_t = 300)]
+        lease_seconds: u64,
+    },
+    /// Sweep expired claims back to `pending`. The daemon does this on
+    /// a 30s timer; this subcommand exists for operators who want to
+    /// force the sweep.
+    Reclaim,
     /// Mark a claimed task as completed with an optional JSON result.
     Complete {
         id: Uuid,
@@ -159,9 +177,41 @@ fn run_client(url: String, cmd: Cmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&task)?);
             Ok(())
         }
-        Cmd::Claim { id, agent_id } => {
-            let task = client.call("tasks/claim", json!({ "id": id, "agentId": agent_id }))?;
+        Cmd::Claim {
+            id,
+            agent_id,
+            lease_seconds,
+        } => {
+            let task = client.call(
+                "tasks/claim",
+                json!({
+                    "id": id,
+                    "agentId": agent_id,
+                    "leaseSeconds": lease_seconds,
+                }),
+            )?;
             println!("{}", serde_json::to_string_pretty(&task)?);
+            Ok(())
+        }
+        Cmd::Extend {
+            id,
+            agent_id,
+            lease_seconds,
+        } => {
+            let resp = client.call(
+                "tasks/extend",
+                json!({
+                    "id": id,
+                    "agentId": agent_id,
+                    "leaseSeconds": lease_seconds,
+                }),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(())
+        }
+        Cmd::Reclaim => {
+            let resp = client.call("tasks/reclaim", json!({}))?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }
         Cmd::Complete { id, result } => {
@@ -188,7 +238,10 @@ fn run_client(url: String, cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Wait(args) => wait::run(&client, &args),
-        Cmd::Serve(_) | Cmd::Mcp(_) | Cmd::Version | Cmd::Init(_) => {
+        Cmd::Serve(_)
+        | Cmd::Mcp(_)
+        | Cmd::Version
+        | Cmd::Init(_) => {
             unreachable!("handled in dispatch")
         }
     }

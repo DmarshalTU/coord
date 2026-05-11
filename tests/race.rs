@@ -36,7 +36,7 @@ fn one_claimer_per_task_under_concurrent_load() {
             let id = *task_id;
             let agent = format!("claimer-{c}");
             handles.push(thread::spawn(move || {
-                store.claim_task(id, &agent).unwrap().is_some()
+                store.claim_task(id, &agent, None).unwrap().is_some()
             }));
         }
     }

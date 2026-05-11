@@ -1,14 +1,27 @@
 # coord
 
-**A local coordinator for parallel AI coding agents. One binary, MCP + A2A.**
+**A local coordinator for parallel AI coding agents. One binary. Atomic
+claims, leased work, blocking watches.**
 
 You run multiple Claude Code / Cursor / Codex tabs in parallel and they have no
 idea the others exist. The tab on `v1.1` finds a regression. The tab on `v1.2`
-keeps building on top of it because nobody told it. `coord` gives those agents
-a shared bulletin board with **atomic task claims** (no two agents grab the
-same work), a **blocking watch primitive** (so an agent can wait on something
-landing instead of polling), and an optional **markdown audit trail** that
-opens in Obsidian as a graph.
+keeps building on top of it because nobody told it.
+
+The headline primitive in `coord` is **a blocking watch**: a Claude or Cursor
+tab can do `coord wait --kind ack --name-contains 'v1.1 stable'` and just sit
+there until some other tab posts a matching task. The daemon holds the
+connection open and returns the instant the match lands — no polling, no
+operator coordination, no instruction loop. It's the difference between
+"please check every minute" and "tell me when it happens."
+
+Backing it are three things that make the watch safe:
+
+- **Atomic task claims** (no two agents grab the same work, proven under
+  16-process contention).
+- **Leased claims that auto-reclaim** if the holding tab dies, so a closed
+  Cursor window doesn't strand work forever.
+- An optional **markdown audit trail** that opens in Obsidian as a graph,
+  showing who-did-what across all sessions.
 
 ```
    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
@@ -24,42 +37,61 @@ opens in Obsidian as a graph.
 
 ## Status
 
-POC. Built in a weekend, used in real demos, two end-to-end tests prove the
-correctness guarantees, but the surface area is still small. `0.x` until it
-gets meaningful production use.
+`0.4`. Ten end-to-end tests gate every change, including a long-poll test
+that proves the watch primitive unblocks server-side (not via client
+polling), a 16-process atomic-claim race, and a lease/auto-reclaim cycle.
+`0.x` until it gets meaningful production use.
 
 ## Why another one of these?
 
-There are several local-coordination layers for AI agents shipping in 2026
-([prior art](#prior-art)). `coord` is opinionated about a few specific things:
+Several local-coordination layers for AI agents shipped between late 2025
+and early 2026 ([prior art](#prior-art)). `coord` is opinionated about a
+small number of things that the others mostly aren't:
 
-- **Atomic claims, not mailboxes.** Most existing tools are messaging /
-  pub-sub layers. `coord` exposes a race-free `tasks/claim` so two agents can
-  both grab for the same task and exactly one wins. The
-  [`tests/race.rs`](tests/race.rs) test hammers 200 tasks × 8 claimers each
-  (1,600 simultaneous claim attempts) and asserts every task ends up with
-  exactly one winner. The
-  [`tests/multi_client.rs`](tests/multi_client.rs) test does the same end-to-
-  end, with 16 independent OS processes racing over HTTP.
-- **Blocking watch primitive.** `coord wait --kind ack --name-contains 'v1.2'`
-  blocks the calling shell until a matching task lands and prints it as JSON.
-  It heartbeats while waiting so the watcher shows as alive. This is what
-  turns a Claude Code tab into a "waiter" with a single chat message instead
-  of an instruction loop.
-- **Two protocols, one daemon.** Speaks A2A (Google's agent-to-agent JSON-RPC
-  subset) on its HTTP surface and acts as an MCP server over stdio for IDE
-  clients that don't speak A2A directly.
-- **Optional Obsidian-readable vault.** Every state change emits a markdown
-  note with `[[wikilinks]]` between related tasks (bug → fix → ack). Drop the
-  vault into Obsidian; the graph view shows who-did-what across all sessions
-  with no plugin.
+- **The watch is the headline.** `coord wait --kind ack --name-contains
+  'v1.2'` is a long-poll under the hood: the daemon holds the request open
+  and returns within milliseconds of the matching task landing.
+  `tests/wait_longpoll.rs` asserts a hot match returns in well under one
+  second on a cold start. This is what turns a Claude Code tab into a
+  "waiter" with one chat message instead of an instruction loop.
+- **Atomic claims with leases, not mailboxes.** Most existing tools are
+  messaging / pub-sub layers. `coord` exposes a race-free `tasks/claim`
+  that grants a *time-bounded lease*. If your agent dies, crashes, or just
+  forgets to call `tasks/complete`, the daemon's background sweep returns
+  the task to `pending` after the lease expires and the next agent picks
+  it up. `tests/lease.rs` proves the full cycle: claim → expire → reclaim
+  → new agent wins → original claimer's stale complete is observable, not
+  silent.
+- **Atomic correctness is tested under contention.** `tests/race.rs`
+  hammers 200 tasks × 8 claimers each (1,600 simultaneous claim attempts)
+  and asserts every task ends up with exactly one winner.
+  `tests/multi_client.rs` does the same end-to-end, with 16 independent OS
+  processes racing over HTTP.
+- **SQL-side filters on `tasks/list`.** Filters (`state`, `kind`,
+  `priority`) push into the `WHERE` clause so a watcher asking for "the
+  most recent pending `bug`" still sees it when 50 newer non-`bug` rows
+  exist. The pre-0.4 in-memory filter silently dropped matches at that
+  scale; `tests/list_filter.rs` is the regression test.
+- **Two protocols, one daemon.** JSON-RPC 2.0 HTTP surface that
+  implements a subset of A2A v1.0 (`tasks/send`, `tasks/get`,
+  `tasks/cancel`) plus local-loop extensions for claims, leases, and the
+  watch. Acts as an MCP server over stdio for IDE clients. Streamable
+  HTTP, signed Agent Cards, and push notifications from full A2A v1.0 are
+  **not** implemented; treat the A2A side as compatibility for create /
+  get / cancel only.
+- **Optional Obsidian-readable vault.** Every state change emits a
+  markdown note with `[[wikilinks]]` between related tasks (bug → fix →
+  ack, claimer → abandoned task). Drop the vault into Obsidian; the graph
+  view shows who-did-what across all sessions with no plugin.
 - **One binary.** `coord serve`, `coord top`, `coord send`, `coord wait`,
-  `coord mcp` — all the same executable. No Python venv, no Docker.
+  `coord claim`, `coord extend`, `coord mcp` — all the same executable.
+  No Python venv, no Docker.
 
-If you want a richer mailbox/email metaphor with file leases and threading,
-[MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) is the
-mature choice. `coord` is the one to reach for if you want claim-and-watch
-semantics with a tiny surface area.
+If you want a richer mailbox/email metaphor with file leases and
+threading, [MCP Agent
+Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) is the more
+mature choice. `coord` is the one to reach for if you want
+claim-and-watch with leased work and a tiny surface area.
 
 ## Install
 
@@ -259,30 +291,45 @@ Tasks have a free-form `kind` and `priority` plus a fixed lifecycle:
 
 ```
 pending  ──claim──▶  claimed  ──complete──▶  completed
-                            └──cancel────▶   cancelled
-                            └──fail──────▶   failed
+   ▲                    ├──cancel────▶   cancelled
+   │                    ├──fail──────▶   failed
+   └────reclaim─────────┘   (when lease_until < now)
 ```
+
+A claim grants a **lease**: a wall-clock window (default 5 minutes, max
+1 hour) within which the claiming agent must either `tasks/complete` or
+`tasks/extend`. If the lease expires the daemon's background ticker (and
+every `tasks/list` call) sweeps the row back to `pending`, clears
+`claimed_by`, and announces it on the change bus so any waiter wakes
+up. A dead Cursor tab no longer strands work.
 
 There's a useful asymmetry: announcement kinds (`ack`, `knowledge`,
 `decision`) start in `completed` rather than `pending` — they're publications,
 not work to be picked up. The TUI's default filter still surfaces them as
 context.
 
-### A2A subset
+### JSON-RPC surface (A2A subset + extensions)
 
-`coord` implements a small JSON-RPC 2.0 subset of Google's A2A spec on
-`POST /` plus an agent card at `GET /.well-known/agent.json`. Methods:
+`coord` serves JSON-RPC 2.0 on `POST /` plus an agent card at `GET
+/.well-known/agent.json`. The `tasks/send`, `tasks/get`, and
+`tasks/cancel` methods follow the A2A v1.0 shape so an A2A-aware client
+can drive create / get / cancel without a custom integration. Streamable
+HTTP, signed Agent Cards, and push notifications are **not** implemented
+— callers should treat the surface as "JSON-RPC with an A2A-compatible
+task subset" rather than full A2A.
 
-| Method            | Purpose                                |
-|-------------------|----------------------------------------|
-| `tasks/send`      | create a task                          |
-| `tasks/get`       | fetch a task by UUID                   |
-| `tasks/list`      | list recent tasks (with kind/state filters) |
-| `tasks/cancel`    | cancel a task                          |
-| `tasks/claim`     | atomic pending→claimed (extension)     |
-| `tasks/complete`  | claimed→completed with result (extension) |
-| `agents/heartbeat`| register/refresh agent presence        |
-| `agents/list`     | list known agents                      |
+| Method             | Purpose                                                              |
+|--------------------|----------------------------------------------------------------------|
+| `tasks/send`       | create a task (A2A-compatible)                                       |
+| `tasks/get`        | fetch a task by UUID (A2A-compatible)                                |
+| `tasks/cancel`     | cancel a task (A2A-compatible)                                       |
+| `tasks/list`       | list with SQL-side filters; pass `wait_ms` to long-poll (extension)  |
+| `tasks/claim`      | atomic pending→claimed with a lease (extension)                      |
+| `tasks/extend`     | push the lease forward, only for the current claimer (extension)     |
+| `tasks/reclaim`    | sweep expired claims back to pending (extension; auto every 30s)     |
+| `tasks/complete`   | claimed→completed with result (extension)                            |
+| `agents/heartbeat` | register/refresh agent presence                                      |
+| `agents/list`      | list known agents                                                    |
 
 ### MCP tools
 
@@ -293,7 +340,7 @@ without a custom integration.
 ## CLI
 
 ```
-coord serve          run the daemon (HTTP A2A surface)
+coord serve          run the daemon (HTTP JSON-RPC surface)
 coord mcp            stdio MCP bridge for IDE clients
 coord init           scaffold a project (.mcp.json + AGENTS.md)
 coord top            live TUI dashboard
@@ -301,11 +348,13 @@ coord status         one-shot summary
 coord tasks          list recent tasks
 coord agents         list known agents
 coord send <name>    create a task (--kind, --priority, --payload)
-coord claim <id>     atomic claim (--as <agent>)
+coord claim <id>     atomic claim with a lease (--as <agent>, --lease <secs>)
+coord extend <id>    push the lease forward (--as <agent>, --lease <secs>)
+coord reclaim        force-sweep expired claims back to pending
 coord complete <id>  mark a claimed task complete (--result <json>)
 coord cancel <id>    cancel a task
 coord heartbeat <id> refresh agent presence
-coord wait           block until a matching task appears
+coord wait           long-poll for a matching task (server-pushed, no polling)
 coord version        version + protocol info
 ```
 
@@ -327,12 +376,21 @@ Every client subcommand obeys `--url` / `COORD_URL` (default
 cargo test
 ```
 
-Three end-to-end tests gate every change:
+Ten tests gate every change:
 
-- `tests/race.rs` — atomic claim under in-process contention
+- `tests/race.rs` — atomic claim under in-process contention (200 tasks × 8 claimers)
 - `tests/multi_client.rs` — atomic claim under multi-process contention
   (real `coord serve` + 16 OS processes over HTTP)
 - `tests/cancel_race.rs` — cancel-vs-complete is sticky
+- `tests/lease.rs` (4 tests) — fresh claim writes lease metadata; extend
+  is current-claimer-only and moves the lease forward; expired claims
+  are reclaimed to `pending` and a different agent can win; completed
+  tasks are not eligible for reclaim
+- `tests/list_filter.rs` — SQL-side filter pushdown surfaces a matching
+  row that 60 newer non-matching rows would otherwise have shadowed
+- `tests/wait_longpoll.rs` — `tasks/list` with `wait_ms` returns within
+  ~hundreds of milliseconds of a matching `tasks/send`, end-to-end over
+  HTTP — proves the watch is server-pushed, not client-polled
 - `tests/tui_render.rs` — TUI snapshot test
 
 ## Prior art

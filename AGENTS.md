@@ -12,16 +12,19 @@ You have two equivalent paths and should pick whichever your runtime
 gives you:
 
 - **MCP tools** (preferred when available): `tasks_send`, `tasks_list`,
-  `tasks_get`, `tasks_claim`, `tasks_complete`, `tasks_cancel`,
-  `agents_heartbeat`, `agents_list`. The MCP server is registered in
-  `.mcp.json` at the project root.
+ `tasks_get`, `tasks_claim`, `tasks_extend`, `tasks_complete`,
+ `tasks_cancel`, `tasks_reclaim`, `agents_heartbeat`, `agents_list`.
+ The MCP server is registered in `.mcp.json` at the project root.
 - **Shell**: the `coord` binary on PATH. `coord send …`, `coord claim …`,
-  `coord wait …`, `coord top`. Use this for `coord wait`, which blocks
-  the calling process until a task appears — the cleanest way to make a
-  tab a "watcher" without polling.
+ `coord extend …`, `coord wait …`, `coord top`. Use this for
+ `coord wait`, which long-polls the daemon and blocks the calling
+ process until a matching task appears — the cleanest way to make a
+ tab a "watcher" without polling.
 
 If both are present, use MCP tools for one-shot calls and `coord wait` in
-shell for blocking watches.
+shell for blocking watches. Both `coord wait` and `tasks_list` with
+`wait_ms` are now server-pushed (long-poll) rather than client-side
+polling, so they're cheap to leave running for hours.
 
 ## Pick a handle
 
@@ -91,9 +94,32 @@ complete it — leave it `pending` so the right tab picks it up.
 
 Use `tasks_claim` *atomically*. If it returns "task is not claimable"
 that's the expected race signal — somebody else got it; pick another.
-After you finish, `tasks_complete` with a JSON `result`. If you can't
-finish, do not silently abandon: post an ack-or-knowledge note
-explaining what's left.
+
+Every claim grants a **lease**: a wall-clock window (default 5 minutes,
+max 1 hour) within which you must either finish the task with
+`tasks_complete` or push the lease forward with `tasks_extend`. If you
+do neither, the daemon's background sweep returns the task to
+`pending` and another tab picks it up. This is the system's only
+protection against your tab dying mid-task, so take it seriously:
+
+- For a short task, the default 5-minute lease is fine.
+- For a long step (a multi-minute compile, a long LLM call), pass
+  `lease_seconds` on `tasks_claim` or call `tasks_extend` before each
+  chunk of work. A good cadence is: extend at the same time you
+  heartbeat.
+- If you discover mid-task that you can't finish, do not silently
+  abandon. Either `tasks_cancel` it (sticky), or `tasks_complete` it
+  with a `result` payload that explains what's left, or post an
+  `ack`/`knowledge` note describing the abandonment and let the lease
+  expire.
+
+```json
+// tasks_claim
+{ "id": "...", "agent_id": "harbor-lynx", "lease_seconds": 600 }
+
+// tasks_extend, called periodically while the task is still claimed
+{ "id": "...", "agent_id": "harbor-lynx", "lease_seconds": 600 }
+```
 
 ## When you're a watcher
 
@@ -113,10 +139,13 @@ waits default to `--state pending`. Pass `--state any` to opt out.
 ## Don't
 
 - Don't fabricate UUIDs to satisfy schema fields. If you don't have a
-  real `fixed_bug_id`, omit it.
-- Don't busy-loop with `tasks_list` when `coord wait` is available.
-- Don't claim and abandon — either complete, or post a note explaining
-  the abandonment and let the operator/another tab pick it up.
+ real `fixed_bug_id`, omit it.
+- Don't busy-loop with `tasks_list` when `coord wait` is available, or
+ when `tasks_list` itself accepts `wait_ms` for long-poll.
+- Don't claim and forget — every claim has a lease, and if you don't
+ extend it the daemon will reclaim the task and hand it to someone
+ else. Either complete, extend periodically, cancel, or post a note
+ explaining the abandonment and let the operator/another tab pick it up.
 
 ## Recap before you stop
 

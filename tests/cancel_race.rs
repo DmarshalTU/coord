@@ -15,7 +15,7 @@ fn cancel_is_sticky_against_late_complete() {
         .create_task("auth-fix", serde_json::json!({}))
         .unwrap();
     store.heartbeat("worker-1", "worker").unwrap();
-    let claimed = store.claim_task(task.id, "worker-1").unwrap();
+    let claimed = store.claim_task(task.id, "worker-1", None).unwrap();
     assert!(claimed.is_some(), "first claim should win");
 
     // Operator cancels the task while the worker is still 'working'.

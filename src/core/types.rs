@@ -47,6 +47,18 @@ pub const DEFAULT_KIND: &str = "task";
 /// render as default.
 pub const DEFAULT_PRIORITY: &str = "normal";
 
+/// Default lease length for a fresh claim, in seconds. Short on purpose:
+/// the cost of "too short" is one extra `tasks/extend` RPC per minute
+/// (cheap), the cost of "too long" is a stuck task blocking the
+/// bulletin for the whole window. Callers can override per-claim and
+/// operators can override the daemon default via `COORD_DEFAULT_LEASE`.
+pub const DEFAULT_LEASE_SECONDS: u64 = 300;
+
+/// Hard ceiling on a single lease. Prevents agents from accidentally
+/// requesting hours-long leases that would defeat the auto-reclaim
+/// loop. Callers that need this much wall-clock should re-extend.
+pub const MAX_LEASE_SECONDS: u64 = 3_600;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
@@ -59,6 +71,16 @@ pub struct Task {
     pub result: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the current claim was last (re-)granted. `None` for tasks
+    /// that have never been claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// Wall-clock deadline after which a claim is considered abandoned
+    /// and the task is eligible for auto-reclaim back to `pending`.
+    /// `None` for unclaimed tasks and for legacy rows from before
+    /// the lease migration ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
