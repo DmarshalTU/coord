@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use coord::core::{store::Store, types::TaskState};
+use coord::core::{
+    store::{CompleteOutcome, Store},
+    types::TaskState,
+};
 
 #[test]
 fn cancel_is_sticky_against_late_complete() {
@@ -22,11 +25,11 @@ fn cancel_is_sticky_against_late_complete() {
     store.cancel_task(task.id).unwrap();
 
     // Worker finishes obliviously and tries to mark complete.
-    let completed = store
-        .complete_task(task.id, serde_json::json!({"result": 42}))
+    let outcome = store
+        .complete_task(task.id, serde_json::json!({"result": 42}), None)
         .unwrap();
     assert!(
-        !completed,
+        matches!(outcome, CompleteOutcome::NotInClaimedState),
         "complete after cancel must report failure, not silently win"
     );
 

@@ -31,6 +31,31 @@ pub struct TaskFilter {
     pub priority: Option<String>,
 }
 
+/// Caller-supplied ack to write atomically alongside a `tasks/complete`.
+/// `priority` defaults to `"high"` if unset (matches the example in
+/// `AGENTS.md`). `payload` is merged with a daemon-injected
+/// `fixed_bug_id` pointing at the source task so the markdown vault
+/// renders the wikilink without the caller having to know the UUID.
+#[derive(Debug, Clone)]
+pub struct AckSpec {
+    pub name: String,
+    pub priority: Option<String>,
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Result of `complete_task`. `Completed { ack }` means the source
+/// task transitioned to `completed`; `ack` is `Some` iff the caller
+/// requested one and it was written in the same transaction.
+///
+/// The completed variant is boxed (well, the `Task` payload is
+/// optional and large) so the enum stays cheap to pass around even
+/// when no ack was requested — clippy yells otherwise.
+#[derive(Debug)]
+pub enum CompleteOutcome {
+    Completed { ack: Box<Option<Task>> },
+    NotInClaimedState,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     vault: Option<Arc<Vault>>,
@@ -361,28 +386,120 @@ impl Store {
     /// Mark a claimed task complete. Idempotent against races: only
     /// transitions when current state is `claimed`, so a `cancel` that
     /// sneaks in first is sticky. Clears the lease so the row no
-    /// longer trips the reclaim sweep. Returns true on success.
-    pub fn complete_task(&self, id: Uuid, result: serde_json::Value) -> Result<bool> {
+    /// longer trips the reclaim sweep. Returns
+    /// `CompleteOutcome::Completed { ack }` on success, where `ack` is
+    /// `Some` if the caller asked for `post_ack` and an ack row was
+    /// written in the same transaction (otherwise `None`).
+    /// `CompleteOutcome::NotInClaimedState` on race.
+    pub fn complete_task(
+        &self,
+        id: Uuid,
+        result: serde_json::Value,
+        ack: Option<AckSpec>,
+    ) -> Result<CompleteOutcome> {
         let now = Utc::now();
         let result_s = serde_json::to_string(&result)?;
-        let updated = {
-            let conn = self.conn.lock();
-            conn.execute(
+
+        // Whole flow runs under a single tx so callers can't observe a
+        // half-completed state: either both the UPDATE and the ack
+        // INSERT land, or neither does. This is the core integrity
+        // claim of `post_ack` — agents reliably leave acks behind.
+        let outcome = {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            let updated = tx.execute(
                 "UPDATE tasks SET state = 'completed', result = ?1, lease_until = NULL,
                                   updated_at = ?2
                  WHERE id = ?3 AND state = 'claimed'",
                 params![result_s, now.to_rfc3339(), id.to_string()],
-            )?
+            )?;
+            if updated == 0 {
+                tx.rollback()?;
+                return Ok(CompleteOutcome::NotInClaimedState);
+            }
+
+            let ack_task = if let Some(spec) = ack {
+                // Daemon stitches the wikilink (`fixed_bug_id` → source
+                // task) into the ack's payload so the vault graph
+                // renders the chain. Caller-supplied payload wins on
+                // key collision so an agent that already knows the
+                // wikilink it wants can override.
+                let mut payload = match spec.payload {
+                    Some(serde_json::Value::Object(m)) => m,
+                    Some(other) => {
+                        // Non-object payload (e.g. caller passed a
+                        // string or array): preserve it under `value`
+                        // and inject the wikilink alongside.
+                        let mut m = serde_json::Map::new();
+                        m.insert("value".into(), other);
+                        m
+                    }
+                    None => serde_json::Map::new(),
+                };
+                payload
+                    .entry("fixed_bug_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(id.to_string()));
+                let payload_v = serde_json::Value::Object(payload);
+                let payload_s = serde_json::to_string(&payload_v)?;
+                let ack_id = Uuid::new_v4();
+                let priority = spec.priority.as_deref().unwrap_or("high");
+                tx.execute(
+                    "INSERT INTO tasks
+                       (id, name, kind, priority, state, payload, created_at, updated_at)
+                     VALUES (?1, ?2, 'ack', ?3, 'completed', ?4, ?5, ?5)",
+                    params![
+                        ack_id.to_string(),
+                        spec.name,
+                        priority,
+                        payload_s,
+                        now.to_rfc3339(),
+                    ],
+                )?;
+                Some(Task {
+                    id: ack_id,
+                    name: spec.name,
+                    kind: "ack".into(),
+                    priority: priority.into(),
+                    state: TaskState::Completed,
+                    claimed_by: None,
+                    payload: payload_v,
+                    result: None,
+                    created_at: now,
+                    updated_at: now,
+                    claimed_at: None,
+                    lease_until: None,
+                })
+            } else {
+                None
+            };
+            tx.commit()?;
+            ack_task
         };
-        if updated > 0 {
-            if let Some(t) = self.get_task(id)? {
-                self.vault_write(&t);
-                if let Some(agent) = &t.claimed_by {
-                    self.vault_agent_event(agent, &format!("completed [[{}]]", task_slug(&t)));
-                }
+
+        if let Some(t) = self.get_task(id)? {
+            self.vault_write(&t);
+            if let Some(agent) = &t.claimed_by {
+                self.vault_agent_event(agent, &format!("completed [[{}]]", task_slug(&t)));
             }
         }
-        Ok(updated > 0)
+        if let Some(ack) = &outcome {
+            // Vault writes happen outside the tx — they're best-effort
+            // and must not fail a coordination call (see vault_write).
+            // The wikilink resolver in `collect_relations` reads the
+            // ack's `fixed_bug_id` and pulls in the source slug.
+            self.vault_write(ack);
+            if let Some(agent) = self
+                .get_task(id)?
+                .and_then(|t| t.claimed_by)
+                .as_deref()
+                .map(str::to_string)
+            {
+                self.vault_agent_event(&agent, &format!("posted ack [[{}]]", task_slug(ack)));
+            }
+        }
+        Ok(CompleteOutcome::Completed {
+            ack: Box::new(outcome),
+        })
     }
 
     pub fn cancel_task(&self, id: Uuid) -> Result<()> {

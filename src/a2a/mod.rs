@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::core::store::{Store, TaskFilter};
+use crate::core::store::{AckSpec, CompleteOutcome, Store, TaskFilter};
 
 /// Bumped whenever a task or agent row changes state. Wait-style
 /// callers subscribe to this channel and unblock the instant a
@@ -205,18 +205,41 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "tasks/complete" => {
             let p: CompleteParams =
                 serde_json::from_value(params).map_err(MethodError::bad_params)?;
-            let ok = state
+            // post_ack is opt-in: agents that already follow a custom
+            // ack convention keep working unchanged; agents that
+            // follow AGENTS.md should set it and get the ack written
+            // atomically.
+            let ack = if p.post_ack {
+                let name = p.ack_name.ok_or_else(|| {
+                    MethodError::bad_params(
+                        "post_ack=true requires ack_name (grep-friendly summary line)",
+                    )
+                })?;
+                Some(AckSpec {
+                    name,
+                    priority: p.ack_priority,
+                    payload: p.ack_payload,
+                })
+            } else {
+                None
+            };
+            let outcome = state
                 .store
-                .complete_task(p.id, p.result.unwrap_or(Value::Null))
+                .complete_task(p.id, p.result.unwrap_or(Value::Null), ack)
                 .map_err(MethodError::internal)?;
-            if !ok {
-                return Err(MethodError::conflict(
+            match outcome {
+                CompleteOutcome::Completed { ack } => {
+                    state.bus.notify();
+                    Ok(json!({
+                        "ok": true,
+                        "ack": ack,
+                    }))
+                }
+                CompleteOutcome::NotInClaimedState => Err(MethodError::conflict(
                     "task is not in 'claimed' state — was it cancelled, already completed, \
                      or reclaimed after its lease expired?",
-                ));
+                )),
             }
-            state.bus.notify();
-            Ok(json!({ "ok": true }))
         }
         "agents/heartbeat" => {
             let p: HeartbeatParams =
@@ -387,6 +410,24 @@ struct CompleteParams {
     id: Uuid,
     #[serde(default)]
     result: Option<Value>,
+    /// Optional one-call ack pattern. When `true`, the daemon writes a
+    /// `kind=ack` row in the same SQLite transaction as the state
+    /// change, with `fixed_bug_id` linking back to this task so the
+    /// vault and any wikilink-aware watcher can stitch the chain.
+    #[serde(default, rename = "postAck")]
+    post_ack: bool,
+    /// Grep-friendly ack name (e.g. "v1.1 prod stable: discount math
+    /// regression fixed"). Required when `post_ack=true`.
+    #[serde(default, rename = "ackName")]
+    ack_name: Option<String>,
+    /// Defaults to "high" on the server. Match this to the priority
+    /// the waiting tab is filtering on.
+    #[serde(default, rename = "ackPriority")]
+    ack_priority: Option<String>,
+    /// Optional JSON payload to attach to the ack. Merged with the
+    /// daemon-injected `fixed_bug_id` wikilink.
+    #[serde(default, rename = "ackPayload")]
+    ack_payload: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

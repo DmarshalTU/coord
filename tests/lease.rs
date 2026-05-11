@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use coord::core::store::Store;
+use coord::core::store::{CompleteOutcome, Store};
 use coord::core::types::TaskState;
 
 #[test]
@@ -123,21 +123,24 @@ fn expired_lease_reclaims_and_lets_a_new_agent_win() {
     // agent-a's late completion attempt must fail (state was rewritten
     // to `pending` and then to `claimed by agent-b`, never back to
     // `claimed by agent-a`).
-    let stale = store
-        .complete_task(task.id, serde_json::json!({"by": "a"}))
-        .unwrap_or(false);
+    let outcome = store
+        .complete_task(task.id, serde_json::json!({"by": "a"}), None)
+        .expect("rpc ok");
     let final_state = store.get_task(task.id).unwrap().unwrap();
     // (`complete_task` does not check the claimer, only the state.
     // After agent-b's claim the state is `claimed`, so a stale
     // complete from agent-a would in fact succeed. Document the
     // observed behavior rather than the desired one — fixing that is
     // a separate, claimer-checked complete in a follow-up.)
-    if stale {
-        assert_eq!(final_state.state, TaskState::Completed);
-        assert_eq!(final_state.claimed_by.as_deref(), Some("agent-b"));
-    } else {
-        assert_eq!(final_state.state, TaskState::Claimed);
-        assert_eq!(final_state.claimed_by.as_deref(), Some("agent-b"));
+    match outcome {
+        CompleteOutcome::Completed { .. } => {
+            assert_eq!(final_state.state, TaskState::Completed);
+            assert_eq!(final_state.claimed_by.as_deref(), Some("agent-b"));
+        }
+        CompleteOutcome::NotInClaimedState => {
+            assert_eq!(final_state.state, TaskState::Claimed);
+            assert_eq!(final_state.claimed_by.as_deref(), Some("agent-b"));
+        }
     }
 }
 
@@ -151,7 +154,7 @@ fn completed_task_does_not_get_reclaimed() {
         .unwrap()
         .unwrap();
     store
-        .complete_task(task.id, serde_json::json!({"by": "a"}))
+        .complete_task(task.id, serde_json::json!({"by": "a"}), None)
         .unwrap();
 
     thread::sleep(Duration::from_millis(1_200));

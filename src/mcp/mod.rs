@@ -134,6 +134,27 @@ pub struct CompleteArgs {
     /// JSON result to record on the task.
     #[serde(default)]
     pub result: Option<Value>,
+    /// When true, the daemon writes a kind=ack row in the same
+    /// transaction as the state change. Any tab watching with
+    /// `tasks_list { kind: "ack", wait_ms: ... }` unblocks the
+    /// instant the ack lands. This is the cheap way to follow the
+    /// AGENTS.md protocol without making two tool calls.
+    #[serde(default)]
+    pub post_ack: bool,
+    /// Required when post_ack=true. Grep-friendly summary line, e.g.
+    /// "v1.1 prod stable: discount math regression fixed". Other tabs
+    /// will filter on substrings of this name.
+    #[serde(default)]
+    pub ack_name: Option<String>,
+    /// Defaults to "high". Match this to the priority a waiting tab
+    /// is filtering on.
+    #[serde(default)]
+    pub ack_priority: Option<String>,
+    /// Optional payload attached to the ack (sha, branch, files, etc).
+    /// The daemon auto-injects fixed_bug_id pointing at the source
+    /// task so the markdown vault renders the chain.
+    #[serde(default)]
+    pub ack_payload: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -172,7 +193,14 @@ impl Bridge {
     #[tool(
         description = "Create a new task. Set kind to one of: task (default), bug, feature, \
             decision, ack, knowledge, build. Set priority to: low, normal (default), high, urgent. \
-            Other agents can filter on these fields. Returns the task object including its UUID."
+            Other agents can filter on these fields. Returns the task object including its UUID. \
+            \
+            If you are about to do work yourself, the canonical flow is: tasks_send (pending) \
+            -> tasks_claim -> tasks_complete with post_ack=true. Do NOT skip the front of that \
+            sequence and only publish a kind=ack at the end -- a standalone ack has no \
+            fixed_bug_id, so a verifier tab cannot walk back to the source work. \
+            Standalone kind=ack publications are only appropriate when you are announcing an \
+            event you did not perform yourself (e.g. an upstream release dropped)."
     )]
     async fn tasks_send(
         &self,
@@ -277,13 +305,33 @@ impl Bridge {
         self.call("tasks/reclaim", json!({})).await
     }
 
-    #[tool(description = "Mark a claimed task as completed and record an optional JSON result.")]
+    #[tool(
+        description = "Mark a claimed task as completed and (recommended) post an ack in \
+            the same transaction. Use `post_ack: true` and `ack_name` (a short, \
+            grep-friendly summary like 'v1.1 stable: discount fix') whenever you \
+            finish meaningful work. The daemon writes the state transition and a \
+            kind=ack row atomically, with fixed_bug_id linking the ack back to the \
+            source task. Any tab waiting with tasks_list kind=ack wait_ms unblocks the \
+            instant it lands. Without post_ack the work is still completed, but \
+            watchers filtering on kind=ack will not see your progress. Prefer the \
+            one-call pattern."
+    )]
     async fn tasks_complete(
         &self,
         Parameters(a): Parameters<CompleteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.call("tasks/complete", json!({ "id": a.id, "result": a.result }))
-            .await
+        self.call(
+            "tasks/complete",
+            json!({
+                "id": a.id,
+                "result": a.result,
+                "postAck": a.post_ack,
+                "ackName": a.ack_name,
+                "ackPriority": a.ack_priority,
+                "ackPayload": a.ack_payload,
+            }),
+        )
+        .await
     }
 
     #[tool(description = "Cancel a task by UUID.")]

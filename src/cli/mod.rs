@@ -84,10 +84,23 @@ pub enum Cmd {
     /// force the sweep.
     Reclaim,
     /// Mark a claimed task as completed with an optional JSON result.
+    /// Pass `--ack` to post a kind=ack row in the same transaction so
+    /// any tab waiting on a matching ack unblocks instantly. This is
+    /// the recommended flow when finishing meaningful work.
     Complete {
         id: Uuid,
         #[arg(long)]
         result: Option<String>,
+        /// Grep-friendly ack summary line (e.g. "v1.1 stable: bug X
+        /// fixed"). Setting this flag enables post_ack on the server.
+        #[arg(long = "ack")]
+        ack_name: Option<String>,
+        /// Priority of the posted ack. Defaults to "high".
+        #[arg(long = "ack-priority")]
+        ack_priority: Option<String>,
+        /// JSON payload for the ack (sha, branch, files, etc).
+        #[arg(long = "ack-payload")]
+        ack_payload: Option<String>,
     },
     /// Cancel a task.
     Cancel { id: Uuid },
@@ -214,9 +227,28 @@ fn run_client(url: String, cmd: Cmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }
-        Cmd::Complete { id, result } => {
+        Cmd::Complete {
+            id,
+            result,
+            ack_name,
+            ack_priority,
+            ack_payload,
+        } => {
             let result: Option<Value> = result.map(|s| serde_json::from_str(&s)).transpose()?;
-            let resp = client.call("tasks/complete", json!({ "id": id, "result": result }))?;
+            let ack_payload: Option<Value> =
+                ack_payload.map(|s| serde_json::from_str(&s)).transpose()?;
+            let post_ack = ack_name.is_some();
+            let resp = client.call(
+                "tasks/complete",
+                json!({
+                    "id": id,
+                    "result": result,
+                    "postAck": post_ack,
+                    "ackName": ack_name,
+                    "ackPriority": ack_priority,
+                    "ackPayload": ack_payload,
+                }),
+            )?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }

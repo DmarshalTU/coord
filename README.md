@@ -37,10 +37,15 @@ Backing it are three things that make the watch safe:
 
 ## Status
 
-`0.4`. Ten end-to-end tests gate every change, including a long-poll test
-that proves the watch primitive unblocks server-side (not via client
-polling), a 16-process atomic-claim race, and a lease/auto-reclaim cycle.
-`0.x` until it gets meaningful production use.
+`0.4.1`. Eleven end-to-end tests gate every change, including a long-poll
+test that proves the watch primitive unblocks server-side (not via client
+polling), a 16-process atomic-claim race, a lease/auto-reclaim cycle, and
+a **protocol-layer two-tab dogfood test** that walks the AGENTS.md
+workflow from completing-with-ack to a second tab verifying the work
+without prior UUID knowledge. `0.4.1` adds atomic `tasks/complete +
+postAck` so finishing a task and announcing it land in the same
+transaction; see [`AGENTS.md`](AGENTS.md). `0.x` until it gets meaningful
+production use.
 
 ## Why another one of these?
 
@@ -72,6 +77,13 @@ small number of things that the others mostly aren't:
   most recent pending `bug`" still sees it when 50 newer non-`bug` rows
   exist. The pre-0.4 in-memory filter silently dropped matches at that
   scale; `tests/list_filter.rs` is the regression test.
+- **Atomic complete-with-ack.** `tasks/complete` accepts a `postAck`
+  flag that writes the `kind=ack` row in the same SQLite transaction as
+  the state change, with `fixed_bug_id` auto-injected to wikilink the
+  ack back to the source task. This closes a 0.4.0 protocol-layer hole
+  where the ack post was a separate (and frequently forgotten) call.
+  `tests/protocol_two_tabs.rs` proves a second tab can discover the work
+  and the ack using only the queries `AGENTS.md` tells it to run.
 - **Two protocols, one daemon.** JSON-RPC 2.0 HTTP surface that
   implements a subset of A2A v1.0 (`tasks/send`, `tasks/get`,
   `tasks/cancel`) plus local-loop extensions for claims, leases, and the
@@ -327,7 +339,7 @@ task subset" rather than full A2A.
 | `tasks/claim`      | atomic pending→claimed with a lease (extension)                      |
 | `tasks/extend`     | push the lease forward, only for the current claimer (extension)     |
 | `tasks/reclaim`    | sweep expired claims back to pending (extension; auto every 30s)     |
-| `tasks/complete`   | claimed→completed with result (extension)                            |
+| `tasks/complete`   | claimed→completed with result; `postAck: true` writes the ack row in the same transaction |
 | `agents/heartbeat` | register/refresh agent presence                                      |
 | `agents/list`      | list known agents                                                    |
 
@@ -376,7 +388,7 @@ Every client subcommand obeys `--url` / `COORD_URL` (default
 cargo test
 ```
 
-Ten tests gate every change:
+Eleven tests gate every change:
 
 - `tests/race.rs` — atomic claim under in-process contention (200 tasks × 8 claimers)
 - `tests/multi_client.rs` — atomic claim under multi-process contention
@@ -391,6 +403,11 @@ Ten tests gate every change:
 - `tests/wait_longpoll.rs` — `tasks/list` with `wait_ms` returns within
   ~hundreds of milliseconds of a matching `tasks/send`, end-to-end over
   HTTP — proves the watch is server-pushed, not client-polled
+- `tests/protocol_two_tabs.rs` — full AGENTS.md workflow over real
+  HTTP: tab A completes a task with `postAck`, tab B then runs ONLY the
+  verification queries `AGENTS.md` prescribes (`kind=ack`,
+  `state=completed`, walk `fixed_bug_id`) and finds both the work and
+  the ack without prior UUID knowledge
 - `tests/tui_render.rs` — TUI snapshot test
 
 ## Prior art

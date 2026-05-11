@@ -1,6 +1,6 @@
 [package]
 name = "coord"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Denis Tu <dmarshaltu@gmail.com>"]
 description = "Local coordinator for parallel AI coding agents. Long-poll watch, leased atomic claims, MCP + A2A-subset JSON-RPC. One binary."
